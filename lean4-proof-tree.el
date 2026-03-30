@@ -235,25 +235,27 @@ Highlight the node at CURSOR-LINE."
 
 (defun lean4-proof-tree--revert (&rest _)
   "Refresh the proof tree."
-  (lean4-proof-tree--update))
+  (when lean4-proof-tree--source-buffer
+    (lean4-proof-tree--update-from
+     lean4-proof-tree--source-buffer)))
 
 ;;; Update
 
-(defun lean4-proof-tree--update ()
-  "Rebuild and render the proof tree."
-  (when-let ((source lean4-proof-tree--source-buffer))
-    (when (buffer-live-p source)
-      (with-current-buffer source
-        (let* ((block (lean4-proof-tree--find-by-block))
-               (cursor-line (line-number-at-pos)))
+(defun lean4-proof-tree--update-from (source)
+  "Rebuild and render the proof tree from SOURCE buffer."
+  (when (buffer-live-p source)
+    (with-current-buffer source
+      (let* ((block (lean4-proof-tree--find-by-block))
+             (cursor-line (line-number-at-pos))
+             (tree-buf (get-buffer lean4-proof-tree-buffer-name)))
+        (when tree-buf
           (if block
               (let* ((tactics (lean4-proof-tree--extract-tactics
                                (car block) (cdr block)))
                      (nodes (lean4-proof-tree--build tactics)))
-                (with-current-buffer
-                    lean4-proof-tree-buffer-name
+                (with-current-buffer tree-buf
                   (lean4-proof-tree--render nodes cursor-line)))
-            (with-current-buffer lean4-proof-tree-buffer-name
+            (with-current-buffer tree-buf
               (lean4-proof-tree--render nil cursor-line))))))))
 
 (defun lean4-proof-tree--update-debounced ()
@@ -262,14 +264,12 @@ Highlight the node at CURSOR-LINE."
              (get-buffer-window lean4-proof-tree-buffer-name t))
     (when lean4-proof-tree--update-timer
       (cancel-timer lean4-proof-tree--update-timer))
-    (let ((buf (current-buffer)))
+    (let ((source (current-buffer)))
       (setq lean4-proof-tree--update-timer
             (run-with-idle-timer
              0.5 nil
              (lambda ()
-               (when (buffer-live-p buf)
-                 (with-current-buffer buf
-                   (lean4-proof-tree--update)))))))))
+               (lean4-proof-tree--update-from source)))))))
 
 ;;; Public API
 
@@ -288,7 +288,7 @@ Highlight the node at CURSOR-LINE."
      buf '((side . right) (window-width . 0.35)))
     (add-hook 'post-command-hook
               #'lean4-proof-tree--update-debounced nil t)
-    (lean4-proof-tree--update)))
+    (lean4-proof-tree--update-from source)))
 
 ;;;###autoload
 (defun lean4-proof-tree-hide ()
@@ -302,11 +302,11 @@ Highlight the node at CURSOR-LINE."
 
 ;;;###autoload
 (defun lean4-proof-tree-toggle ()
-  "Toggle the proof tree display."
+  "Show or refresh the proof tree display.
+If the panel is not visible, open it. If it is already visible,
+refresh it with the current tactic block."
   (interactive)
-  (if (get-buffer-window lean4-proof-tree-buffer-name t)
-      (lean4-proof-tree-hide)
-    (lean4-proof-tree-show)))
+  (lean4-proof-tree-show))
 
 ;; Keybinding
 (with-eval-after-load 'lean4-mode
