@@ -8,7 +8,7 @@
 ;; Package-Requires: ((emacs "29.1") (lean4-mode "1.1.0") (dash "2.18.0"))
 ;; URL: https://github.com/BaDaaS/lean4-proof-tree
 ;; SPDX-License-Identifier: Apache-2.0
-;; Version: 0.2.0
+;; Version: 0.3.0
 
 ;; This file is not part of GNU Emacs.
 
@@ -22,12 +22,17 @@
 
 ;; Visualize Lean 4 tactic proofs as derivation trees.
 ;;
-;; When editing a tactic proof (a `by' block), this package queries
-;; the Lean LSP server for the goal state at each tactic step and
-;; renders a tree showing how goals are created, split, and closed.
+;; This package uses a server-side Lean 4 library that traverses
+;; the InfoTree to build real proof trees with parent-child
+;; relationships between tactics.
 ;;
-;; Usage:
-;;   M-x lean4-proof-tree-show   (or C-c C-t in lean4-mode)
+;; Setup:
+;;   1. Add the ProofTree Lake dependency to your Lean project
+;;   2. Import ProofTree in your Lean files
+;;   3. Use C-c C-t to toggle the proof tree panel
+;;
+;; The tree is built from the Lean elaborator's InfoTree, giving
+;; correct parent-child edges even for complex tactics.
 
 ;;; Code:
 
@@ -36,7 +41,9 @@
 
 ;; Forward declarations
 (declare-function lsp-request "ext:lsp-mode")
+(declare-function lsp-request-async "ext:lsp-mode")
 (declare-function lsp--text-document-identifier "ext:lsp-mode")
+(declare-function lsp--buffer-uri "ext:lsp-mode")
 (defvar lean4-mode-map)
 
 ;;; Customization
@@ -49,6 +56,14 @@
 (defcustom lean4-proof-tree-buffer-name "*Lean Proof Tree*"
   "Name of the proof tree buffer."
   :type 'string
+  :group 'lean4-proof-tree)
+
+(defcustom lean4-proof-tree-use-rpc t
+  "Use the server-side RPC endpoint for proof trees.
+When non-nil, calls ProofTree.getProofTree via RPC (requires
+the ProofTree Lake dependency). When nil, falls back to
+per-line plainGoal queries."
+  :type 'boolean
   :group 'lean4-proof-tree)
 
 ;;; Faces
@@ -81,16 +96,60 @@
   "Face for the tactic at the current cursor position."
   :group 'lean4-proof-tree)
 
-;;; Data structures
+(defface lean4-proof-tree-branch-face
+  '((t :inherit shadow))
+  "Face for tree branch drawing characters."
+  :group 'lean4-proof-tree)
 
-(cl-defstruct lean4-proof-tree-node
-  "A node in the proof tree."
-  tactic        ;; string: the tactic text
-  goals-after   ;; list of goal strings after this tactic
-  line          ;; integer: source line number
-  closed-p)     ;; boolean: all goals resolved
+;;; RPC session management
 
-;;; Tactic block parsing
+(defvar-local lean4-proof-tree--rpc-session nil
+  "RPC session ID for the current buffer.")
+
+(defun lean4-proof-tree--rpc-connect ()
+  "Connect to the Lean RPC server for the current buffer.
+Return the session ID string."
+  (require 'lsp-mode)
+  (or lean4-proof-tree--rpc-session
+      (let* ((params (list :uri (lsp--buffer-uri)))
+             (result (lsp-request "$/lean/rpc/connect" params)))
+        (setq lean4-proof-tree--rpc-session
+              (gethash "sessionId" result)))))
+
+(defun lean4-proof-tree--rpc-call (method params)
+  "Call RPC METHOD with PARAMS via $/lean/rpc/call.
+Return the result hash table."
+  (require 'lsp-mode)
+  (let* ((session (lean4-proof-tree--rpc-connect))
+         (rpc-params (list :sessionId session
+                           :method method
+                           :params params)))
+    (condition-case err
+        (lsp-request "$/lean/rpc/call" rpc-params)
+      (error
+       ;; Session might have expired, reconnect and retry once
+       (setq lean4-proof-tree--rpc-session nil)
+       (let* ((session2 (lean4-proof-tree--rpc-connect))
+              (rpc-params2 (list :sessionId session2
+                                 :method method
+                                 :params params)))
+         (lsp-request "$/lean/rpc/call" rpc-params2))))))
+
+;;; RPC-based tree querying
+
+(defun lean4-proof-tree--query-rpc (line col)
+  "Query the proof tree at LINE (1-indexed) and COL via RPC.
+Return the parsed tree as a nested alist, or nil."
+  (condition-case nil
+      (let* ((pos (list :line (1- line) :character col))
+             (params (list :pos pos))
+             (result (lean4-proof-tree--rpc-call
+                      "ProofTree.getProofTree" params)))
+        (when result
+          (gethash "root" result)))
+    (error nil)))
+
+;;; Fallback: per-line plainGoal queries (Option A)
 
 (defun lean4-proof-tree--find-by-block ()
   "Find the `by' block surrounding point.
@@ -102,16 +161,11 @@ Return (START-LINE . END-LINE) or nil."
       (when (re-search-backward
              (rx word-start "by" word-end) nil t)
         (setq start (line-number-at-pos))
-        ;; Find the indentation of the first tactic line after `by'.
-        ;; Tactics must be indented at least this much.
         (forward-line 1)
-        ;; Skip blank lines to find first tactic
         (while (and (not (eobp))
                     (looking-at-p "^\\s-*$"))
           (forward-line 1))
         (let ((tactic-col (if (eobp) 0 (current-indentation))))
-          ;; Walk forward while lines are blank or indented
-          ;; at least as much as the first tactic
           (when (> tactic-col 0)
             (forward-line 1)
             (while (and (not (eobp))
@@ -124,9 +178,7 @@ Return (START-LINE . END-LINE) or nil."
           (cons start end))))))
 
 (defun lean4-proof-tree--extract-tactics (beg end)
-  "Extract tactic lines between BEG and END.
-Return a list of (LINE . TEXT) pairs, skipping blanks,
-comments, and the `by' keyword."
+  "Extract tactic lines between BEG and END."
   (save-excursion
     (goto-char (point-min))
     (forward-line (1- beg))
@@ -146,11 +198,8 @@ comments, and the `by' keyword."
         (forward-line 1))
       (nreverse result))))
 
-;;; LSP goal querying
-
-(defun lean4-proof-tree--query-goals (line)
-  "Query goals at the end of LINE (1-indexed) synchronously.
-Return a list of goal strings, or nil."
+(defun lean4-proof-tree--query-goals-fallback (line)
+  "Query goals at end of LINE via plainGoal (fallback)."
   (require 'lsp-mode)
   (condition-case nil
       (let* ((col (save-excursion
@@ -167,50 +216,109 @@ Return a list of goal strings, or nil."
           (append (gethash "goals" result) nil)))
     (error nil)))
 
-;;; Tree building
+;;; Tree rendering
 
-(defun lean4-proof-tree--build (tactics)
-  "Build proof tree nodes from TACTICS.
-TACTICS is a list of (LINE . TEXT) pairs."
-  (let ((nodes nil))
-    (dolist (tac tactics)
-      (let* ((line (car tac))
-             (text (cdr tac))
-             (goals (lean4-proof-tree--query-goals line)))
-        (push (make-lean4-proof-tree-node
-               :tactic text
-               :goals-after goals
-               :line line
-               :closed-p (null goals))
-              nodes)))
-    (nreverse nodes)))
+(defun lean4-proof-tree--json-get (obj key)
+  "Get KEY from JSON OBJ (hash table or plist)."
+  (if (hash-table-p obj)
+      (gethash key obj)
+    (plist-get obj (intern (concat ":" key)))))
 
-;;; Rendering
+(defun lean4-proof-tree--render-rpc-tree (node depth prefix
+                                                last-p
+                                                cursor-line)
+  "Render a single RPC tree NODE at DEPTH with PREFIX.
+LAST-P is non-nil if this is the last sibling.
+CURSOR-LINE highlights the active tactic."
+  (let* ((tactic (lean4-proof-tree--json-get node "tactic"))
+         (goals-after (lean4-proof-tree--json-get node "goalsAfter"))
+         (children (lean4-proof-tree--json-get node "children"))
+         (range (lean4-proof-tree--json-get node "range"))
+         (closed (or (null goals-after)
+                     (= (length goals-after) 0)))
+         ;; Determine if cursor is on this tactic
+         (at-cursor
+          (when range
+            (let* ((start (lean4-proof-tree--json-get range "start"))
+                   (start-line
+                    (1+ (lean4-proof-tree--json-get start "line"))))
+              (= start-line cursor-line))))
+         ;; Branch characters
+         (connector
+          (if (= depth 0) ""
+            (propertize (if last-p "`-- " "|-- ")
+                        'face 'lean4-proof-tree-branch-face)))
+         (child-prefix
+          (if (= depth 0) ""
+            (concat prefix
+                    (propertize (if last-p "    " "|   ")
+                                'face
+                                'lean4-proof-tree-branch-face))))
+         (status (if closed " [done]" ""))
+         (line-beg (point)))
+    ;; Tactic line
+    (insert prefix connector
+            (propertize (or tactic "?")
+                        'face 'lean4-proof-tree-tactic-face)
+            (propertize status
+                        'face (if closed
+                                  'lean4-proof-tree-closed-face
+                                'lean4-proof-tree-open-face))
+            "\n")
+    (when at-cursor
+      (put-text-property line-beg (point)
+                         'face 'lean4-proof-tree-cursor-face))
+    ;; Show goals if open and no children
+    (when (and goals-after (not closed)
+               (or (null children) (= (length children) 0)))
+      (let ((goals-list (append goals-after nil)))
+        (dolist (g goals-list)
+          (let ((target (lean4-proof-tree--json-get g "target")))
+            (when target
+              (insert child-prefix "  "
+                      (propertize target
+                                  'face 'lean4-proof-tree-goal-face)
+                      "\n"))))))
+    ;; Render children
+    (when children
+      (let* ((child-list (append children nil))
+             (len (length child-list)))
+        (cl-loop for child in child-list
+                 for idx from 0
+                 do (lean4-proof-tree--render-rpc-tree
+                     child (1+ depth) child-prefix
+                     (= idx (1- len))
+                     cursor-line))))))
 
-(defun lean4-proof-tree--render-goal-short (goal)
-  "Extract the target type from GOAL, after the turnstile."
-  (if (string-match "|-\\s-*\\(.+\\)" goal)
-      (string-trim (match-string 1 goal))
-    (string-trim goal)))
-
-(defun lean4-proof-tree--render (nodes cursor-line)
-  "Render NODES into the current buffer.
-Highlight the node at CURSOR-LINE."
+(defun lean4-proof-tree--render-rpc (root cursor-line)
+  "Render the RPC proof tree ROOT into the current buffer."
   (let ((inhibit-read-only t))
     (erase-buffer)
-    (if (null nodes)
+    (if (null root)
+        (insert "No proof tree found at point.\n"
+                "\n"
+                "Make sure your Lean file imports ProofTree:\n"
+                "  import ProofTree\n")
+      (lean4-proof-tree--render-rpc-tree
+       root 0 "" t cursor-line))
+    (goto-char (point-min))))
+
+(defun lean4-proof-tree--render-fallback (tactics cursor-line)
+  "Render flat tactic list TACTICS (fallback mode)."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (if (null tactics)
         (insert "No tactic block found at point.\n")
-      (dolist (node nodes)
-        (let* ((tactic (lean4-proof-tree-node-tactic node))
-               (goals (lean4-proof-tree-node-goals-after node))
-               (closed (lean4-proof-tree-node-closed-p node))
-               (at-cursor (= (lean4-proof-tree-node-line node)
-                             cursor-line))
-               (status (if closed " [done]" ""))
+      (dolist (tac tactics)
+        (let* ((line (car tac))
+               (text (cdr tac))
+               (goals (lean4-proof-tree--query-goals-fallback line))
+               (closed (null goals))
+               (at-cursor (= line cursor-line))
                (line-beg (point)))
-          (insert (propertize tactic
+          (insert (propertize text
                               'face 'lean4-proof-tree-tactic-face)
-                  (propertize status
+                  (propertize (if closed " [done]" "")
                               'face (if closed
                                         'lean4-proof-tree-closed-face
                                       'lean4-proof-tree-open-face))
@@ -222,8 +330,7 @@ Highlight the node at CURSOR-LINE."
             (dolist (g goals)
               (insert "  "
                       (propertize
-                       (concat "|- "
-                               (lean4-proof-tree--render-goal-short g))
+                       (concat "|- " (string-trim g))
                        'face 'lean4-proof-tree-goal-face)
                       "\n"))))))
     (goto-char (point-min))))
@@ -256,18 +363,28 @@ Highlight the node at CURSOR-LINE."
   "Rebuild and render the proof tree from SOURCE buffer."
   (when (buffer-live-p source)
     (with-current-buffer source
-      (let* ((block (lean4-proof-tree--find-by-block))
-             (cursor-line (line-number-at-pos))
-             (tree-buf (get-buffer lean4-proof-tree-buffer-name)))
+      (let ((cursor-line (line-number-at-pos))
+            (tree-buf (get-buffer lean4-proof-tree-buffer-name)))
         (when tree-buf
-          (if block
-              (let* ((tactics (lean4-proof-tree--extract-tactics
-                               (car block) (cdr block)))
-                     (nodes (lean4-proof-tree--build tactics)))
+          (if lean4-proof-tree-use-rpc
+              ;; Option C: RPC-based tree from InfoTree
+              (let ((root (lean4-proof-tree--query-rpc
+                           cursor-line 0)))
                 (with-current-buffer tree-buf
-                  (lean4-proof-tree--render nodes cursor-line)))
-            (with-current-buffer tree-buf
-              (lean4-proof-tree--render nil cursor-line))))))))
+                  (lean4-proof-tree--render-rpc
+                   root cursor-line)))
+            ;; Fallback: per-line plainGoal
+            (let ((block (lean4-proof-tree--find-by-block)))
+              (if block
+                  (let ((tactics
+                         (lean4-proof-tree--extract-tactics
+                          (car block) (cdr block))))
+                    (with-current-buffer tree-buf
+                      (lean4-proof-tree--render-fallback
+                       tactics cursor-line)))
+                (with-current-buffer tree-buf
+                  (lean4-proof-tree--render-fallback
+                   nil cursor-line))))))))))
 
 (defun lean4-proof-tree--update-debounced ()
   "Debounced proof tree update."
@@ -313,9 +430,7 @@ Highlight the node at CURSOR-LINE."
 
 ;;;###autoload
 (defun lean4-proof-tree-toggle ()
-  "Show or refresh the proof tree display.
-If the panel is not visible, open it. If it is already visible,
-refresh it with the current tactic block."
+  "Show or refresh the proof tree display."
   (interactive)
   (lean4-proof-tree-show))
 

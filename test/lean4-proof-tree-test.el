@@ -10,8 +10,7 @@
 ;;; Test helpers
 
 (defmacro lean4-proof-tree-test--with-buffer (content &rest body)
-  "Insert CONTENT into a temp buffer and execute BODY.
-Point is placed at the end of CONTENT."
+  "Insert CONTENT into a temp buffer and execute BODY."
   (declare (indent 1))
   `(with-temp-buffer
      (insert ,content)
@@ -25,7 +24,7 @@ Point is placed at the end of CONTENT."
   (lean4-proof-tree-test--with-buffer
       "theorem foo : True := by\n  trivial\n"
     (goto-char (point-min))
-    (forward-line 1)  ;; on `trivial`
+    (forward-line 1)
     (let ((block (lean4-proof-tree--find-by-block)))
       (should block)
       (should (= (car block) 1))
@@ -39,7 +38,7 @@ Point is placed at the end of CONTENT."
               "  exact h.1\n"
               "  exact h.2\n")
     (goto-char (point-min))
-    (forward-line 2)  ;; on `exact h.1`
+    (forward-line 2)
     (let ((block (lean4-proof-tree--find-by-block)))
       (should block)
       (should (= (car block) 1))
@@ -55,7 +54,7 @@ Point is placed at the end of CONTENT."
               "  apply hpq\n"
               "  exact hp\n")
     (goto-char (point-min))
-    (forward-line 4)  ;; on `apply hpq`
+    (forward-line 4)
     (let ((block (lean4-proof-tree--find-by-block)))
       (should block)
       (should (= (car block) 2))
@@ -68,7 +67,7 @@ Point is placed at the end of CONTENT."
               "\n"
               "theorem bar : True := by\n"
               "  trivial\n")
-    (goto-char (point-min))  ;; on `def foo`
+    (goto-char (point-min))
     (should-not (lean4-proof-tree--find-by-block))))
 
 (ert-deftest lean4-proof-tree-find-by-block-no-by ()
@@ -120,78 +119,98 @@ Point is placed at the end of CONTENT."
       (should (= (length tactics) 1))
       (should (string= (cdar tactics) "trivial")))))
 
-;;; Tests for lean4-proof-tree--render-goal-short
+;;; Tests for lean4-proof-tree--render-rpc-tree
 
-(ert-deftest lean4-proof-tree-render-goal-with-turnstile ()
-  "Extract target after turnstile."
-  (should (string= (lean4-proof-tree--render-goal-short
-                     "h : Nat |- True")
-                    "True")))
+(defun lean4-proof-tree-test--make-node
+    (tactic goals-after children &optional range)
+  "Build a hash table mimicking an RPC tree node."
+  (let ((ht (make-hash-table :test 'equal)))
+    (puthash "tactic" tactic ht)
+    (puthash "goalsAfter" goals-after ht)
+    (puthash "children" children ht)
+    (puthash "goalsBefore" [] ht)
+    (puthash "range" range ht)
+    ht))
 
-(ert-deftest lean4-proof-tree-render-goal-without-turnstile ()
-  "Return the goal as-is if no turnstile."
-  (should (string= (lean4-proof-tree--render-goal-short "True")
-                    "True")))
+(defun lean4-proof-tree-test--make-goal (target)
+  "Build a hash table mimicking an RPC goal."
+  (let ((ht (make-hash-table :test 'equal)))
+    (puthash "id" "m1" ht)
+    (puthash "hypotheses" [] ht)
+    (puthash "target" target ht)
+    ht))
 
-(ert-deftest lean4-proof-tree-render-goal-trims-whitespace ()
-  "Trim whitespace around the target."
-  (should (string= (lean4-proof-tree--render-goal-short
-                     "h : Nat |-  True  ")
-                    "True")))
-
-;;; Tests for lean4-proof-tree--render
-
-(ert-deftest lean4-proof-tree-render-empty ()
-  "Render nil nodes shows placeholder text."
+(ert-deftest lean4-proof-tree-render-rpc-nil ()
+  "Render nil root shows help text."
   (with-temp-buffer
-    (lean4-proof-tree--render nil 1)
-    (should (string-match-p "No tactic block"
+    (lean4-proof-tree--render-rpc nil 1)
+    (should (string-match-p "No proof tree"
                             (buffer-string)))))
 
-(ert-deftest lean4-proof-tree-render-closed-node ()
-  "Render a closed node shows [done]."
+(ert-deftest lean4-proof-tree-render-rpc-closed-leaf ()
+  "Render a closed leaf node shows [done]."
   (with-temp-buffer
-    (let ((node (make-lean4-proof-tree-node
-                 :tactic "trivial"
-                 :goals-after nil
-                 :line 2
-                 :closed-p t)))
-      (lean4-proof-tree--render (list node) 1)
-      (should (string-match-p "trivial"
-                              (buffer-string)))
-      (should (string-match-p "\\[done\\]"
-                              (buffer-string))))))
+    (let ((node (lean4-proof-tree-test--make-node
+                 "exact hp" [] [])))
+      (lean4-proof-tree--render-rpc node 1)
+      (should (string-match-p "exact hp" (buffer-string)))
+      (should (string-match-p "\\[done\\]" (buffer-string))))))
 
-(ert-deftest lean4-proof-tree-render-open-node-shows-goals ()
-  "Render an open node shows remaining goals."
+(ert-deftest lean4-proof-tree-render-rpc-open-leaf ()
+  "Render an open leaf shows goals."
   (with-temp-buffer
-    (let ((node (make-lean4-proof-tree-node
-                 :tactic "constructor"
-                 :goals-after '("h : P |- Q" "h : P |- R")
-                 :line 2
-                 :closed-p nil)))
-      (lean4-proof-tree--render (list node) 1)
-      (should (string-match-p "constructor"
-                              (buffer-string)))
-      (should (string-match-p "|- Q"
-                              (buffer-string)))
-      (should (string-match-p "|- R"
-                              (buffer-string))))))
+    (let* ((goal (lean4-proof-tree-test--make-goal "Q"))
+           (node (lean4-proof-tree-test--make-node
+                  "intro h" (vector goal) [])))
+      (lean4-proof-tree--render-rpc node 1)
+      (should (string-match-p "intro h" (buffer-string)))
+      (should (string-match-p "Q" (buffer-string))))))
 
-;;; Tests for node struct
+(ert-deftest lean4-proof-tree-render-rpc-tree-with-children ()
+  "Render a tree with children draws branches."
+  (with-temp-buffer
+    (let* ((child1 (lean4-proof-tree-test--make-node
+                    "exact h.2" [] []))
+           (child2 (lean4-proof-tree-test--make-node
+                    "exact h.1" [] []))
+           (root (lean4-proof-tree-test--make-node
+                  "constructor" []
+                  (vector child1 child2))))
+      (lean4-proof-tree--render-rpc root 1)
+      (let ((text (buffer-string)))
+        (should (string-match-p "constructor" text))
+        (should (string-match-p "exact h.2" text))
+        (should (string-match-p "exact h.1" text))
+        (should (string-match-p "\\[done\\]" text))))))
 
-(ert-deftest lean4-proof-tree-node-accessors ()
-  "Node struct accessors work."
-  (let ((node (make-lean4-proof-tree-node
-               :tactic "intro h"
-               :goals-after '("goal1")
-               :line 5
-               :closed-p nil)))
-    (should (string= (lean4-proof-tree-node-tactic node) "intro h"))
-    (should (equal (lean4-proof-tree-node-goals-after node)
-                   '("goal1")))
-    (should (= (lean4-proof-tree-node-line node) 5))
-    (should-not (lean4-proof-tree-node-closed-p node))))
+(ert-deftest lean4-proof-tree-render-rpc-nested ()
+  "Render a nested tree preserves structure."
+  (with-temp-buffer
+    (let* ((leaf (lean4-proof-tree-test--make-node
+                  "exact hp" [] []))
+           (mid (lean4-proof-tree-test--make-node
+                 "apply hqr" []
+                 (vector leaf)))
+           (root (lean4-proof-tree-test--make-node
+                  "intro h" []
+                  (vector mid))))
+      (lean4-proof-tree--render-rpc root 1)
+      (let ((text (buffer-string)))
+        (should (string-match-p "intro h" text))
+        (should (string-match-p "apply hqr" text))
+        (should (string-match-p "exact hp" text))))))
+
+;;; Tests for JSON accessor
+
+(ert-deftest lean4-proof-tree-json-get-hash ()
+  "Access hash table keys."
+  (let ((ht (make-hash-table :test 'equal)))
+    (puthash "foo" 42 ht)
+    (should (= (lean4-proof-tree--json-get ht "foo") 42))))
+
+(ert-deftest lean4-proof-tree-json-get-plist ()
+  "Access plist keys."
+  (should (= (lean4-proof-tree--json-get '(:foo 42) "foo") 42)))
 
 (provide 'lean4-proof-tree-test)
 ;;; lean4-proof-tree-test.el ends here
