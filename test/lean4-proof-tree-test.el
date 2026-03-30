@@ -45,6 +45,22 @@ Point is placed at the end of CONTENT."
       (should (= (car block) 1))
       (should (= (cdr block) 4)))))
 
+(ert-deftest lean4-proof-tree-find-by-block-multiline-signature ()
+  "Find by block when theorem signature wraps across lines."
+  (lean4-proof-tree-test--with-buffer
+      (concat "theorem trans_tactic (P Q R : Prop) :\n"
+              "    (P -> Q) -> (Q -> R) -> P -> R := by\n"
+              "  intro hpq hqr hp\n"
+              "  apply hqr\n"
+              "  apply hpq\n"
+              "  exact hp\n")
+    (goto-char (point-min))
+    (forward-line 4)  ;; on `apply hpq`
+    (let ((block (lean4-proof-tree--find-by-block)))
+      (should block)
+      (should (= (car block) 2))
+      (should (= (cdr block) 6)))))
+
 (ert-deftest lean4-proof-tree-find-by-block-outside ()
   "Return nil when point is outside any by block."
   (lean4-proof-tree-test--with-buffer

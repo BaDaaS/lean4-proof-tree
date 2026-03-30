@@ -102,12 +102,23 @@ Return (START-LINE . END-LINE) or nil."
       (when (re-search-backward
              (rx word-start "by" word-end) nil t)
         (setq start (line-number-at-pos))
-        (let ((by-col (current-indentation)))
-          (forward-line 1)
-          (while (and (not (eobp))
-                      (or (looking-at-p "^\\s-*$")
-                          (> (current-indentation) by-col)))
-            (forward-line 1))
+        ;; Find the indentation of the first tactic line after `by'.
+        ;; Tactics must be indented at least this much.
+        (forward-line 1)
+        ;; Skip blank lines to find first tactic
+        (while (and (not (eobp))
+                    (looking-at-p "^\\s-*$"))
+          (forward-line 1))
+        (let ((tactic-col (if (eobp) 0 (current-indentation))))
+          ;; Walk forward while lines are blank or indented
+          ;; at least as much as the first tactic
+          (when (> tactic-col 0)
+            (forward-line 1)
+            (while (and (not (eobp))
+                        (or (looking-at-p "^\\s-*$")
+                            (>= (current-indentation)
+                                tactic-col)))
+              (forward-line 1)))
           (setq end (1- (line-number-at-pos))))
         (when (and (<= start orig) (>= end orig))
           (cons start end))))))
