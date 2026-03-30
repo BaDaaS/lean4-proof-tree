@@ -8,7 +8,7 @@
 ;; Package-Requires: ((emacs "29.1") (lean4-mode "1.1.0") (dash "2.18.0"))
 ;; URL: https://github.com/BaDaaS/lean4-proof-tree
 ;; SPDX-License-Identifier: Apache-2.0
-;; Version: 0.1.0
+;; Version: 0.2.0
 
 ;; This file is not part of GNU Emacs.
 
